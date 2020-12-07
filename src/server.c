@@ -3717,6 +3717,10 @@ int processCommand(client *c) {
             rejectCommandFormat(c,
                 "-NOPERM this user has no permissions to run "
                 "the '%s' command or its subcommand", c->cmd->name);
+        else if (acl_retval == ACL_DENIED_DB)
+            rejectCommandFormat(c,
+                    "-NOPERM this user has no permissions to access "
+                    "the selected db");
         else
             rejectCommandFormat(c,
                 "-NOPERM this user has no permissions to access "

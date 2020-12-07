@@ -247,6 +247,7 @@ user *ACLCreateUser(const char *name, size_t namelen) {
     u->passwords = listCreate();
     u->patterns = listCreate();
     u->channels = listCreate();
+    u->all_db_access = 1;
     listSetMatchMethod(u->passwords,ACLListMatchSds);
     listSetFreeMethod(u->passwords,ACLListFreeSds);
     listSetDupMethod(u->passwords,ACLListDupSds);
@@ -332,6 +333,8 @@ void ACLCopyUser(user *dst, user *src) {
     memcpy(dst->allowed_commands,src->allowed_commands,
            sizeof(dst->allowed_commands));
     dst->flags = src->flags;
+    dst->all_db_access = src->all_db_access;
+    dst->db_access_flags = src->db_access_flags;
     ACLResetSubcommands(dst);
     /* Copy the allowed subcommands array of array of SDS strings. */
     if (src->allowed_subcommands) {
@@ -377,6 +380,18 @@ int ACLGetUserCommandBit(user *u, unsigned long id) {
     uint64_t word, bit;
     if (ACLGetCommandBitCoordinates(id,&word,&bit) == C_ERR) return 0;
     return (u->allowed_commands[word] & bit) != 0;
+}
+
+int ACLSetUserDbBit(user *u, int db) {
+  if (db < 0 || db >= server.dbnum) {
+    return C_ERR;
+  }
+  if (u->all_db_access) {
+    u->all_db_access = 0;
+  }
+  uint64_t bit = (1 << db);
+  u->db_access_flags |= bit;
+  return C_OK;
 }
 
 /* When +@all or allcommands is given, we set a reserved bit as well that we
@@ -449,6 +464,34 @@ int ACLCountCategoryBitsForUser(user *u, unsigned long *on, unsigned long *off,
     }
     dictReleaseIterator(di);
     return C_OK;
+}
+
+sds ACLDescribeUserDB(user *u) {
+    sds dbs = sdsempty();
+    if (u != NULL) {
+        if (u->all_db_access) {
+            dbs = sdscat(dbs, "dbs[*]");
+        } else {
+            dbs = sdscat(dbs, "dbs[");
+            int firstDb = 1;
+            for (int i=0; i<server.dbnum; i++) {
+                if ((u->db_access_flags & (1 << i))) {
+                    char c[2];
+                    sprintf(c, "%d", i);
+                    if (!firstDb) {
+                        dbs = sdscatlen(dbs, ",", 1);
+                        firstDb = 0;
+                    }
+                    dbs = sdscat(dbs, c);
+                }
+            }
+            if (firstDb) {
+                dbs = sdscatlen(dbs, "-", 1);
+            }
+            dbs = sdscatlen(dbs, "]", 1);
+        }
+    }
+    return dbs;
 }
 
 /* This function returns an SDS string representing the specified user ACL
@@ -662,6 +705,15 @@ sds ACLDescribeUser(user *u) {
     sds rules = ACLDescribeUserCommandRules(u);
     res = sdscatsds(res,rules);
     sdsfree(rules);
+
+    /* For debugging the user's db access. */
+    if (0) {
+        res = sdscatlen(res, " ", 1);
+        sds dbs = ACLDescribeUserDB(u);
+        res = sdscatsds(res, dbs);
+        sdsfree(dbs);
+    }
+
     return res;
 }
 
@@ -944,6 +996,11 @@ int ACLSetUser(user *u, const char *op, ssize_t oplen) {
             unsigned long id = ACLGetCommandID(op+1);
             ACLSetUserCommandBit(u,id,1);
             ACLResetSubcommandsForCommand(u,id);
+            /* Reset the user to access all dbs. */
+            if (!strcasecmp(op, "select")) {
+                u->all_db_access = 1;
+                u->db_access_flags = 0;
+            }
         } else {
             /* Split the command and subcommand parts. */
             char *copy = zstrdup(op+1);
@@ -980,6 +1037,13 @@ int ACLSetUser(user *u, const char *op, ssize_t oplen) {
             /* Add the subcommand to the list of valid ones. */
             ACLAddAllowedSubcommand(u,id,sub);
 
+          /* Provide the user access to the db provided. The select
+           * command is being used to provide select access  */
+          if (!strcasecmp(copy, "select")) {
+            int db = atoi(sub);
+            ACLSetUserDbBit(u, db);
+          }
+
             /* We have to clear the command bit so that we force the
              * subcommand check. */
             ACLSetUserCommandBit(u,id,0);
@@ -993,6 +1057,11 @@ int ACLSetUser(user *u, const char *op, ssize_t oplen) {
         unsigned long id = ACLGetCommandID(op+1);
         ACLSetUserCommandBit(u,id,0);
         ACLResetSubcommandsForCommand(u,id);
+
+        if (!strcasecmp(op+1, "select")) {
+            u->all_db_access = 0;
+            u->db_access_flags = 0;
+        }
     } else if ((op[0] == '+' || op[0] == '-') && op[1] == '@') {
         int bitval = op[0] == '+' ? 1 : 0;
         if (ACLSetUserCommandBitsForCategory(u,op+2,bitval) == C_ERR) {
@@ -1113,13 +1182,22 @@ int ACLCheckUserCredentials(robj *username, robj *password) {
  * ACLCheckUserCredentials(). */
 int ACLAuthenticateUser(client *c, robj *username, robj *password) {
     if (ACLCheckUserCredentials(username,password) == C_OK) {
+        user *u = ACLGetUserByName(username->ptr, sdslen(username->ptr));
+        /* Before modifying the client's user, verify
+         * if the user has permission to access the
+         * db. */
+        if (ACLCheckDbPerm(u, c->db->id) != C_OK) {
+            addACLLogEntry(c,ACL_DENIED_DB,0,username->ptr);
+            errno = EINVAL;
+            return ACL_DENIED_DB;
+        }
+        c->user = u;
         c->authenticated = 1;
-        c->user = ACLGetUserByName(username->ptr,sdslen(username->ptr));
         moduleNotifyUserChanged(c);
-        return C_OK;
+        return ACL_OK;
     } else {
         addACLLogEntry(c,ACL_DENIED_AUTH,0,username->ptr);
-        return C_ERR;
+        return ACL_DENIED_AUTH;
     }
 }
 
@@ -1249,6 +1327,18 @@ int ACLCheckCommandPerm(client *c, int *keyidxptr) {
         getKeysFreeResult(&result);
     }
 
+    int is_write_command = (c->cmd->flags & CMD_WRITE) ||
+                           (c->cmd->proc == execCommand && (c->mstate.cmd_flags & CMD_WRITE));
+    int is_read_command = (c->cmd->flags & CMD_READONLY) ||
+                          (c->cmd->proc == execCommand && (c->mstate.cmd_flags & CMD_READONLY));
+
+    /* If the command is impacting the db keyspace. */
+
+    /* Currently the client lands onto db:0 by default. */
+    if ((is_read_command || is_write_command) && ACLCheckDbPerm(u, c->db->id)) {
+        return ACL_DENIED_DB;
+    }
+
     /* If we survived all the above checks, the user can execute the
      * command. */
     return ACL_OK;
@@ -1279,6 +1369,20 @@ int ACLCheckPubsubChannelPerm(sds channel, list *allowed, int literal) {
         return ACL_DENIED_CHANNEL;
     }
     return ACL_OK;
+}
+
+/* Check if the user has permission to the db. */
+int ACLCheckDbPerm(user *u, int db) {
+
+    /* If there is no associated user, the connection can run anything. */
+    if (u == NULL) return C_OK;
+    
+    if (u->all_db_access) return C_OK;
+
+    if (!(u->db_access_flags & (1 << db))) {
+        return C_ERR;
+    }
+    return C_OK;
 }
 
 /* Check if the user's existing pub/sub clients violate the ACL pub/sub
@@ -1801,6 +1905,7 @@ void addACLLogEntry(client *c, int reason, int argpos, sds username) {
     case ACL_DENIED_KEY: le->object = sdsdup(c->argv[argpos]->ptr); break;
     case ACL_DENIED_CHANNEL: le->object = sdsdup(c->argv[argpos]->ptr); break;
     case ACL_DENIED_AUTH: le->object = sdsdup(c->argv[0]->ptr); break;
+    case ACL_DENIED_DB: le->object = sdsdup(c->argv[0]->ptr); break;
     default: le->object = sdsempty();
     }
 
@@ -2148,6 +2253,7 @@ void aclCommand(client *c) {
             case ACL_DENIED_KEY: reasonstr="key"; break;
             case ACL_DENIED_CHANNEL: reasonstr="channel"; break;
             case ACL_DENIED_AUTH: reasonstr="auth"; break;
+            case ACL_DENIED_DB: reasonstr="db"; break;
             default: reasonstr="unknown";
             }
             addReplyBulkCString(c,reasonstr);
@@ -2238,10 +2344,14 @@ void authCommand(client *c) {
         password = c->argv[2];
     }
 
-    if (ACLAuthenticateUser(c,username,password) == C_OK) {
+    int resp_code = ACLAuthenticateUser(c,username,password);
+    if (resp_code == ACL_OK) {
         addReply(c,shared.ok);
-    } else {
+    } else if  (resp_code == ACL_DENIED_AUTH) {
         addReplyError(c,"-WRONGPASS invalid username-password pair or user is disabled.");
+    } else if (resp_code == ACL_DENIED_DB) {
+        addReplyError(c,"-NOPERM user doesn't have permission to"
+                        " access the current db.");
     }
 
     /* Free the "default" string object we created for the two

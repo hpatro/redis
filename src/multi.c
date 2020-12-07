@@ -216,6 +216,9 @@ void execCommand(client *c) {
             case ACL_DENIED_CHANNEL:
                 reason = "no permission to publish to the specified channel";
                 break;
+            case ACL_DENIED_DB:
+                reason = "no permission to access the db";
+                break;
             default:
                 reason = "no permission";
                 break;

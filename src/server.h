@@ -807,6 +807,10 @@ typedef struct {
                         field is NULL the user cannot mention any channel in a
                         `PUBLISH` or [P][UNSUSBSCRIBE] command, unless the flag
                         ALLCHANNELS is set in the user. */
+    int all_db_access; /* By default set to true. user has access to all dbs. */
+    uint64_t db_access_flags; /* This field gets used, if a user has access to 
+                                 particular dbs from [0, server.dbnum). And the
+                                 particular least significant bit is set to 1. */
 } user;
 
 /* With multiplexing we need to take per-client state.
@@ -1980,6 +1984,7 @@ void ACLInit(void);
 #define ACL_DENIED_KEY 2
 #define ACL_DENIED_AUTH 3 /* Only used for ACL LOG entries. */
 #define ACL_DENIED_CHANNEL 4 /* Only used for pub/sub commands */
+#define ACL_DENIED_DB 5 /* Used to indicate the user doesn't have permission to DB. */
 int ACLCheckUserCredentials(robj *username, robj *password);
 int ACLAuthenticateUser(client *c, robj *username, robj *password);
 unsigned long ACLGetCommandID(const char *cmdname);
@@ -1987,6 +1992,7 @@ void ACLClearCommandID(void);
 user *ACLGetUserByName(const char *name, size_t namelen);
 int ACLCheckCommandPerm(client *c, int *keyidxptr);
 int ACLCheckPubsubPerm(client *c, int idx, int count, int literal, int *idxptr);
+int ACLCheckDbPerm(user *u, int db);
 int ACLSetUser(user *u, const char *op, ssize_t oplen);
 sds ACLDefaultUserFirstPassword(void);
 uint64_t ACLGetCommandCategoryFlagByName(const char *name);
