@@ -30,6 +30,11 @@
 #include "server.h"
 #include <math.h>
 
+#define OBJ_HSET_NO_FLAGS 0
+#define OBJ_HSET_EX (1<<0)          /* Set if time in seconds is given */
+#define OBJ_HSET_PX (1<<1)          /* Set if time in ms in given */
+#define OBJ_HSET_KEEPTTL (1<<2)     /* Set and keep the ttl */
+
 /*-----------------------------------------------------------------------------
  * Hash type API
  *----------------------------------------------------------------------------*/
@@ -616,6 +621,70 @@ void hsetnxCommand(client *c) {
         notifyKeyspaceEvent(NOTIFY_HASH,"hset",c->argv[1],c->db->id);
         server.dirty++;
     }
+}
+
+void hsetexpCommand(client *c) {
+    int j, created = 0;
+    robj *o, *expire;
+    int unit = UNIT_SECONDS;
+    uint64_t flags = OBJ_HSET_NO_FLAGS;
+
+    for (j = 4; j < c->argc; j++) {
+        char *a = c->argv[j]->ptr;
+        robj *next = (j == c->argc - 1) ? NULL : c->argv[j + 1];
+
+        if (!strcasecmp(c->argv[j]->ptr, "KEEPTTL") &&
+            !(flags & OBJ_HSET_EX) && !(flags & OBJ_HSET_PX)) {
+            flags |= OBJ_HSET_KEEPTTL;
+        } else if ((a[0] == 'e' || a[0] == 'E') &&
+                   (a[1] == 'x' || a[1] == 'X') && a[2] == '\0' &&
+                   !(flags & OBJ_HSET_KEEPTTL) &&
+                   !(flags & OBJ_HSET_PX) && next) {
+            flags |= OBJ_HSET_EX;
+            unit = UNIT_SECONDS;
+            expire = next;
+            j++;
+        } else if ((a[0] == 'p' || a[0] == 'P') &&
+                   (a[1] == 'x' || a[1] == 'X') && a[2] == '\0' &&
+                   !(flags & OBJ_HSET_KEEPTTL) &&
+                   !(flags & OBJ_HSET_EX) && next) {
+            flags |= OBJ_HSET_PX;
+            unit = UNIT_MILLISECONDS;
+            expire = next;
+            j++;
+        } else {
+            addReply(c, shared.syntaxerr);
+            return;
+        }
+    }
+
+    if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
+    hashTypeTryConversion(o,c->argv,2,c->argc-1);
+
+    created = !hashTypeSet(o, c->argv[2]->ptr, c->argv[3]->ptr, HASH_SET_COPY);
+    addReplyLongLong(c, created);
+    
+    long long milliseconds = 0;
+    if (expire) {
+        if (getLongLongFromObjectOrReply(c, expire, &milliseconds, NULL) != C_OK)
+            return;
+        if (milliseconds <= 0) {
+            addReplyErrorFormat(c,"invalid expire time in %s",c->cmd->name);
+            return;
+        }
+        if (unit == UNIT_SECONDS) milliseconds *= 1000;
+
+        /* Set an expire to the specified key. */
+        setExpire(c,c->db,c->argv[1],mstime()+milliseconds);
+        notifyKeyspaceEvent(NOTIFY_GENERIC,
+                            "expire",c->argv[1],c->db->id);
+    }
+    if (!(flags & OBJ_HSET_KEEPTTL)) {
+        removeExpire(c->db, c->argv[1]);
+    }
+    signalModifiedKey(c,c->db,c->argv[1]);
+    notifyKeyspaceEvent(NOTIFY_HASH,"hsetexp",c->argv[1],c->db->id);
+    server.dirty++;
 }
 
 void hsetCommand(client *c) {

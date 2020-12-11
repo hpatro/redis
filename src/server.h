@@ -2484,6 +2484,7 @@ void zrankCommand(client *c);
 void zrevrankCommand(client *c);
 void hsetCommand(client *c);
 void hsetnxCommand(client *c);
+void hsetexpCommand(client *c);
 void hgetCommand(client *c);
 void hmsetCommand(client *c);
 void hmgetCommand(client *c);
